@@ -302,8 +302,6 @@ def _render_blog_png(title, content, meta, category, hashtags, image_b64):
       └──────────────────────────────┘
     No paragraphs. No bullets. No body text. Just title + image.
     """
-
-    """
     try:
         from PIL import Image, ImageDraw, ImageFont
     except ImportError:
