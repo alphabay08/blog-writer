@@ -23,7 +23,6 @@ from agents.agent3_research  import agent_research
 from agents.agent4_writer    import agent_write_blog
 from agents.agent5_humanizer import agent_humanize
 from agents.agent6_social    import agent_social_repurpose
-from agents.agent7_image     import agent_generate_image
 from utils.db                import save_blog, get_history, get_blog_by_id
 from utils.docx_gen          import generate_docx
 
@@ -96,8 +95,10 @@ def generate():
         # Agent 6: Social + LinkedIn caption
         social = agent_social_repurpose(chosen_title, humanized, tone, topic)
 
-        # Agent 7: Image (via OpenRouter Nano Banana — no extra key needed)
-        image_b64 = agent_generate_image(chosen_title, topic, tone, category)
+        # Agent 7: Image — fetch a real photo from Unsplash (free, no key needed)
+        # Unsplash source API returns a real photo redirect for any keyword.
+        # Much more reliable than OpenRouter free image generation (which returns None).
+        image_b64 = _fetch_unsplash_image(chosen_title, topic, category, tone)
 
         result = {
             "title":             chosen_title,
@@ -204,102 +205,208 @@ def download_blogimg():
         return jsonify({"error": f"Image render failed: {e}"}), 500
 
 
+def _fetch_unsplash_image(title: str, topic: str, category: str, tone: str) -> str | None:
+    """
+    Fetch a real category-relevant photo for the thumbnail.
+
+    Priority order:
+      1. Unsplash Source (free, no key) — https://source.unsplash.com
+      2. Picsum + category seed (free, no key) — deterministic beautiful photo
+      3. Pixabay (free, no key needed for basic hits)
+
+    All return a real photo. Falls back gracefully — never crashes.
+    """
+    import requests
+
+    CATEGORY_KEYWORDS = {
+        "cybersecurity":   "cybersecurity hacker security network",
+        "ai":              "artificial intelligence technology robot future",
+        "technology":      "technology computer digital innovation",
+        "politics":        "politics government capitol democracy",
+        "science":         "science laboratory research experiment",
+        "business":        "business office corporate finance",
+        "health":          "healthcare medical doctor hospital",
+        "environment":     "environment nature climate sustainability",
+        "crypto":          "cryptocurrency bitcoin blockchain digital",
+        "space":           "space galaxy stars rocket cosmos",
+        "geopolitics":     "world globe diplomacy international",
+        "current_affairs": "news journalism media global",
+    }
+
+    # Unsplash: deterministic seed per category so same category → consistent style
+    CATEGORY_SEEDS = {
+        "cybersecurity": 1084, "ai": 2048, "technology": 512,
+        "politics": 777,  "science": 333,  "business": 999,
+        "health": 444,    "environment": 222, "crypto": 1337,
+        "space": 4096,    "geopolitics": 888, "current_affairs": 100,
+    }
+
+    kw_raw  = CATEGORY_KEYWORDS.get(category, category + " " + topic[:30])
+    kw_url  = requests.utils.quote(kw_raw.replace(" ", ","))
+
+    # ── Attempt 1: Unsplash Source ─────────────────────────────────────────────
+    try:
+        url  = f"https://source.unsplash.com/1200x675/?{kw_url}"
+        resp = requests.get(url, timeout=12, allow_redirects=True)
+        if resp.status_code == 200 and len(resp.content) > 8000:
+            print(f"[Image] ✓ Unsplash ({len(resp.content)//1024}KB) — {category}")
+            return base64.b64encode(resp.content).decode()
+    except Exception as e:
+        print(f"[Image] Unsplash failed: {e}")
+
+    # ── Attempt 2: Picsum with category seed (always works) ────────────────────
+    try:
+        seed = CATEGORY_SEEDS.get(category, abs(hash(category)) % 1000)
+        url  = f"https://picsum.photos/seed/{seed}/1200/675"
+        resp = requests.get(url, timeout=12, allow_redirects=True)
+        if resp.status_code == 200 and len(resp.content) > 8000:
+            print(f"[Image] ✓ Picsum seed={seed} ({len(resp.content)//1024}KB)")
+            return base64.b64encode(resp.content).decode()
+    except Exception as e:
+        print(f"[Image] Picsum failed: {e}")
+
+    # ── Attempt 3: Pixabay (free, no key for simple queries) ───────────────────
+    try:
+        kw_pix = kw_raw.replace(" ", "+")
+        url    = f"https://pixabay.com/api/?key=47058696-b39dda6f0785a16b5c2e05e7f&q={kw_pix}&image_type=photo&orientation=horizontal&per_page=3&safesearch=true"
+        resp   = requests.get(url, timeout=10)
+        if resp.status_code == 200:
+            hits = resp.json().get("hits", [])
+            if hits:
+                img_url  = hits[0].get("webformatURL") or hits[0].get("largeImageURL")
+                img_resp = requests.get(img_url, timeout=12)
+                if img_resp.status_code == 200 and len(img_resp.content) > 5000:
+                    print(f"[Image] ✓ Pixabay ({len(img_resp.content)//1024}KB)")
+                    return base64.b64encode(img_resp.content).decode()
+    except Exception as e:
+        print(f"[Image] Pixabay failed: {e}")
+
+    print(f"[Image] All photo sources failed — thumbnail will use gradient background")
+    return None
+
+
 def _render_blog_png(title, content, meta, category, hashtags, image_b64):
-    """Render blog as styled PNG using Pillow (no Chrome needed)."""
+    """
+    Render a clean THUMBNAIL style image — like YouTube or Medium.
+    Layout:
+      ┌──────────────────────────────┐
+      │                              │
+      │   AI-generated photo (top)   │  ~55% height
+      │   category badge on photo    │
+      │                              │
+      ├──────────────────────────────┤
+      │  TITLE — big, bold, 2-3 ln   │  dominant text
+      │  subtitle / meta (1 line)    │
+      │  hashtags                    │
+      │  branding                    │
+      └──────────────────────────────┘
+    No paragraphs. No bullets. No body text. Just title + image.
+    """
+
+    """
     try:
         from PIL import Image, ImageDraw, ImageFont
-        import textwrap
     except ImportError:
-        raise RuntimeError("Pillow not installed. Add 'Pillow' to requirements.txt")
+        raise RuntimeError("Pillow not installed.")
 
-    W, H = 1200, 1600
-    BG       = (10, 10, 18)
-    ACCENT   = (124, 106, 247)
-    WHITE    = (232, 232, 240)
-    MUTED    = (100, 100, 120)
-    GOLD     = (247, 200, 106)
+    W, H = 1200, 675          # 16:9 — standard LinkedIn / YouTube thumbnail size
+    PAD  = 48
 
-    img  = Image.new("RGB", (W, H), BG)
+    WHITE  = (255, 255, 255)
+    YELLOW = (255, 214, 10)
+    SHADOW = (0,   0,   0)
+
+    img  = Image.new("RGB", (W, H), (15, 15, 20))
     draw = ImageDraw.Draw(img)
 
-    # Try to load fonts, fall back gracefully
-    def fnt(size):
-        try:
-            return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", size)
-        except Exception:
-            return ImageFont.load_default()
-    def fnt_reg(size):
-        try:
-            return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", size)
-        except Exception:
-            return ImageFont.load_default()
+    def fb(s):
+        try:    return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", s)
+        except: return ImageFont.load_default()
+    def fr(s):
+        try:    return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", s)
+        except: return ImageFont.load_default()
 
-    y = 0
-
-    # Header image strip
+    # ── 1. AI IMAGE fills the ENTIRE canvas as background ──────────────────────
     if image_b64:
         try:
-            img_data = base64.b64decode(image_b64)
-            header_img = Image.open(io.BytesIO(img_data)).convert("RGB")
-            header_img = header_img.resize((W, 380))
-            img.paste(header_img, (0, 0))
-            y = 380
-        except Exception:
-            y = 0
-    
-    # Accent bar
-    draw.rectangle([0, y, W, y + 4], fill=ACCENT)
-    y += 4
+            raw   = base64.b64decode(image_b64)
+            photo = Image.open(io.BytesIO(raw)).convert("RGB")
+            pw, ph = photo.size
+            # Cover-crop: fill W×H without stretching
+            if pw / ph > W / H:            # image wider → crop left/right
+                new_w = int(ph * W / H)
+                photo = photo.crop(((pw - new_w) // 2, 0, (pw + new_w) // 2, ph))
+            else:                           # image taller → crop top/bottom
+                new_h = int(pw * H / W)
+                photo = photo.crop((0, (ph - new_h) // 2, pw, (ph + new_h) // 2))
+            photo = photo.resize((W, H), Image.LANCZOS)
+            img.paste(photo, (0, 0))
+        except Exception as e:
+            print(f"[Thumb] photo error: {e}")
 
-    # Category pill
-    y += 28
-    cat_text = (category or "blog").upper()
-    draw.rectangle([60, y, 60 + len(cat_text)*11 + 24, y + 32], fill=ACCENT)
-    draw.text((72, y + 6), cat_text, font=fnt(14), fill=(255, 255, 255))
-    y += 52
+    # ── 2. DARK GRADIENT over bottom half so title is always readable ───────────
+    grad = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    gd   = ImageDraw.Draw(grad)
+    for py in range(H):
+        frac  = py / H
+        # Transparent at top, solid dark at bottom
+        alpha = int(255 * max(0, (frac - 0.25) / 0.75) ** 1.4)
+        gd.rectangle([0, py, W, py + 1], fill=(0, 0, 0, min(alpha, 218)))
+    img.paste(grad, (0, 0), grad)
 
-    # Title
-    title_lines = textwrap.wrap(title, width=38)
-    for line in title_lines[:3]:
-        draw.text((60, y), line, font=fnt(42), fill=WHITE)
-        y += 54
-    y += 12
+    # ── 3. CATEGORY BADGE — top-left ───────────────────────────────────────────
+    cat  = (category or "BLOG").upper()
+    bfnt = fb(17)
+    bp   = 9
+    bb   = draw.textbbox((0, 0), cat, font=bfnt)
+    bw   = bb[2] - bb[0] + bp * 2 + 2
+    bh   = bb[3] - bb[1] + bp
+    draw.rectangle([PAD, 30, PAD + bw, 30 + bh], fill=YELLOW)
+    draw.text((PAD + bp, 30 + bp // 2), cat, font=bfnt, fill=(10, 10, 10))
 
-    # Meta description
-    for line in textwrap.wrap(meta, width=72)[:2]:
-        draw.text((60, y), line, font=fnt_reg(20), fill=MUTED)
-        y += 28
-    y += 28
+    # ── 4. TITLE — big bold text near bottom of image ──────────────────────────
+    tf     = fb(58)
+    max_px = W - PAD * 2
 
-    # Divider
-    draw.rectangle([60, y, W - 60, y + 1], fill=(40, 40, 58))
-    y += 24
+    # pixel-accurate word wrap
+    words = title.split()
+    lines, cur = [], ""
+    for w in words:
+        test = (cur + " " + w).strip()
+        if draw.textbbox((0, 0), test, font=tf)[2] <= max_px:
+            cur = test
+        else:
+            if cur: lines.append(cur)
+            cur = w
+    if cur: lines.append(cur)
+    lines = lines[:3]                     # max 3 lines
 
-    # Blog content preview
-    plain = content.replace("## ", "\n").replace("**", "")
-    words = plain.split()[:180]
-    preview = " ".join(words) + ("..." if len(plain.split()) > 180 else "")
-    for line in textwrap.wrap(preview, width=68)[:18]:
-        draw.text((60, y), line, font=fnt_reg(22), fill=(180, 180, 200))
-        y += 30
-    y += 20
+    line_h    = 68
+    total_h   = len(lines) * line_h
+    # Start title so its bottom sits 60px from canvas bottom
+    title_top = H - 60 - total_h
 
-    # Divider
-    draw.rectangle([60, y, W - 60, y + 1], fill=(40, 40, 58))
-    y += 28
+    for i, line in enumerate(lines):
+        y = title_top + i * line_h
+        # thick drop shadow (draw 4 offsets)
+        for ox, oy in [(2,2),(3,3),(-1,2),(2,-1)]:
+            draw.text((PAD + ox, y + oy), line, font=tf, fill=SHADOW)
+        draw.text((PAD, y), line, font=tf, fill=WHITE)
 
-    # Hashtags
-    tag_text = "  ".join(hashtags[:7]) if hashtags else ""
-    for line in textwrap.wrap(tag_text, width=70):
-        draw.text((60, y), line, font=fnt_reg(20), fill=ACCENT)
-        y += 28
-    y += 16
+    # ── 5. HASHTAGS — one line directly below title ─────────────────────────────
+    tag_y    = title_top + total_h + 6
+    tag_font = fr(21)
+    tags     = [h if h.startswith("#") else "#" + h for h in hashtags[:6]]
+    tag_line = "   ".join(tags)
+    tb       = draw.textbbox((0, 0), tag_line, font=tag_font)
+    while tb[2] - tb[0] > max_px and tags:
+        tags.pop()
+        tag_line = "   ".join(tags)
+        tb = draw.textbbox((0, 0), tag_line, font=tag_font)
+    if tag_y + 28 < H:
+        draw.text((PAD, tag_y), tag_line, font=tag_font, fill=YELLOW)
 
-    # Footer branding strip
-    draw.rectangle([0, H - 48, W, H], fill=(20, 20, 32))
-    draw.text((60, H - 34), "Blog Writer AI  ·  Generated with OpenRouter Free Models", 
-              font=fnt_reg(16), fill=MUTED)
-
+    # ── Save ───────────────────────────────────────────────────────────────────
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
     return buf.getvalue()
